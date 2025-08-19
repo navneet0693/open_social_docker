@@ -1,109 +1,140 @@
-FROM drupal:10.3.11-php8.3
+# Optimized Multi-Stage Dockerfile for Open Social
+# Demonstrating various size reduction techniques
+
+# Stage 1: Base with minimal runtime dependencies
+FROM drupal:10.3.11-php8.3 AS base
 LABEL org.opencontainers.image.authors="devel@goalgorilla.com"
 
-# Install packages.
+# Install only essential runtime packages
 RUN apt-get update && apt-get install -y \
-  zlib1g-dev \
-  libssl-dev \
-  libxml2-dev \
-  mariadb-client \
-  curl \
-  wget \
-  git \
-  msmtp \
-  libzip-dev \
-  nano \
-  7zip \
-  vim && \
-  apt-get clean
+    mariadb-client \
+    msmtp \
+    libzip-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
-
-ADD mailcatcher-msmtp.conf /etc/msmtprc
-
-RUN echo 'sendmail_path = "/usr/bin/msmtp -t"' > /usr/local/etc/php/conf.d/mail.ini
-
-ADD php.ini /usr/local/etc/php/php.ini
-
-# Install extensions
+# Install only essential PHP extensions
 RUN curl -sSLf \
         -o /usr/local/bin/install-php-extensions \
-        https://github.com/mlocati/docker-php-extension-installer/releases/latest/download/install-php-extensions && \
-    chmod +x /usr/local/bin/install-php-extensions
-RUN install-php-extensions zip bcmath exif sockets soap gmp intl redis rdkafka
+        https://github.com/mlocati/docker-php-extension-installer/releases/latest/download/install-php-extensions \
+    && chmod +x /usr/local/bin/install-php-extensions \
+    && install-php-extensions zip bcmath intl redis
 
-# Install Composer.
+# Install Composer
 RUN php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');" \
-    php -r "if (hash_file('sha384', 'composer-setup.php') === 'e21205b207c3ff031906575712edab6f13eb0b361f2085f1f1237b7126d785e826a450292b6cfd1d64d92e6563bbde02') { echo 'Installer verified'; } else { echo 'Installer corrupt'; unlink('composer-setup.php'); } echo PHP_EOL;" \
-    php composer-setup.php \
-    php -r "unlink('composer-setup.php');"
+    && php -r "if (hash_file('sha384', 'composer-setup.php') === 'dac665fdc30fdd8ec78b38b9800061b4150413ff2e3b6f88543c636f7cd84f6db9189d43a81e5503cda447da73c7e5b6') { echo 'Installer verified'.PHP_EOL; } else { echo 'Installer corrupt'.PHP_EOL; unlink('composer-setup.php'); exit(1); }" \
+    && php composer-setup.php --install-dir=/usr/local/bin --filename=composer \
+    && php -r "unlink('composer-setup.php');"
 
+# Configure mail settings
+COPY mailcatcher-msmtp.conf /etc/msmtprc
+RUN echo 'sendmail_path = "/usr/bin/msmtp -t"' > /usr/local/etc/php/conf.d/mail.ini
 
-# Install Open Social via composer.
-RUN rm -f /var/www/composer.lock
-RUN rm -rf /root/.composer
+# Stage 2: Dependencies installation (cached separately)
+FROM base AS dependencies
+WORKDIR /var/www
 
-ADD composer.json /var/www/composer.json
-WORKDIR /var/www/
+# Install git for dependency installation
+RUN apt-get update && apt-get install -y git \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY composer.json ./
 ENV COMPOSER_ALLOW_SUPERUSER=1
-RUN COMPOSER_MEMORY_LIMIT=-1 composer install --prefer-dist --no-interaction --no-dev
+ENV COMPOSER_MEMORY_LIMIT=-1
+RUN composer install --prefer-dist --no-interaction --no-dev --optimize-autoloader --no-scripts
 
-WORKDIR /var/www/html/
-RUN chown -R www-data:www-data *
+# Stage 3: Production environment (minimal)
+FROM base AS production
+WORKDIR /var/www/html
 
-RUN php -r 'opcache_reset();'
+# Copy only production dependencies
+COPY --from=dependencies /var/www/vendor /var/www/vendor
 
-# Fix shell.
-RUN echo "export TERM=xterm" >> ~/.bashrc
+# Copy PHP configuration optimized for production
+COPY php.ini /usr/local/etc/php/php.ini
 
-### CI SPECIFIC - START ###
-### - Making changes here? Also apply in ../ci/Dockerfile ###
+# Set proper permissions
+RUN chown -R www-data:www-data * \
+    && php -r 'opcache_reset();'
 
-# Specify the work directory.
-WORKDIR /var/www/
+# Stage 4: Development environment (includes dev tools)
+FROM base AS development
+WORKDIR /var/www
 
-# Install composer dependencies.
+# Install additional development packages
+RUN apt-get update && apt-get install -y \
+    git curl wget nano vim 7zip \
+    zlib1g-dev libssl-dev libxml2-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install additional PHP extensions for development
+RUN install-php-extensions exif sockets soap gmp rdkafka
+
+# Copy dependencies from dependencies stage
+COPY --from=dependencies /var/www/vendor /var/www/vendor
+
+# Copy composer files and install dev dependencies
+COPY composer.json ./
+ENV COMPOSER_ALLOW_SUPERUSER=1
+ENV COMPOSER_MEMORY_LIMIT=-1
 RUN composer install --prefer-dist --no-interaction
 
-# Unfortunately, adding the composer vendor dir to the PATH doesn't seem to work. So:
-RUN ln -s /root/.composer/vendor/bin/behat /usr/local/bin/behat
-RUN ln -s /root/.composer/vendor/bin/phpunit /usr/local/bin/phpunit
+# Install development tools
+RUN ln -s /root/.composer/vendor/bin/behat /usr/local/bin/behat \
+    && ln -s /root/.composer/vendor/bin/phpunit /usr/local/bin/phpunit
 
-# Drush 12 removes the need for the launcher and uses composer from vendor binary.
+# Set PATH for development tools
 ENV PATH="$PATH:/var/www/vendor/bin:/usr/local/bin"
 
-### CI SPECIFIC - END ###
+# Install and configure Xdebug for development
+RUN pecl install xdebug-3.3.2 \
+    && docker-php-ext-enable xdebug \
+    && echo "xdebug.mode=debug" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini \
+    && echo "xdebug.client_port=9003" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini \
+    && echo "xdebug.discover_client_host=true" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini \
+    && echo "xdebug.client_host=host.docker.internal" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini \
+    && echo "xdebug.idekey=PHPSTORM" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini \
+    && echo "xdebug.max_nesting_level=500" >> /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
 
-### DEV SPECIFIC - START ###
+# Configure shell
+RUN echo "export TERM=xterm" >> ~/.bashrc
 
-ADD php.ini /usr/local/etc/php/php.ini
+# Set proper permissions
+WORKDIR /var/www/html
+RUN chown -R www-data:www-data * \
+    && php -r 'opcache_reset();'
 
-# Xdebug.
-RUN pecl install xdebug-3.3.2 && \
-    docker-php-ext-enable xdebug && \
-    sed -i '1 a xdebug.client_port=9003' /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini && \
-    sed -i '1 a xdebug.mode=debug' /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini && \
-    sed -i '1 a xdebug.discover_client_host=true' /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini && \
-    sed -i '1 a xdebug.client_host=host.docker.internal' /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini && \
-    sed -i '1 a xdebug.idekey=PHPSTORMi' /usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
+# Stage 5: CI environment (testing focused)
+FROM base AS ci
+WORKDIR /var/www
 
-# Blackfire
-# @todo Fix PHP 8 based blackfire installation
-#RUN version=$(php -r "echo PHP_MAJOR_VERSION.PHP_MINOR_VERSION;") \
-#    && architecture=$(uname -m) \
-#    && curl -A "Docker" -o /tmp/blackfire-probe.tar.gz -D - -L -s https://blackfire.io/api/v1/releases/probe/php/linux/$architecture/$version \
-#    && mkdir -p /tmp/blackfire \
-#    && tar zxpf /tmp/blackfire-probe.tar.gz -C /tmp/blackfire \
-#    && mv /tmp/blackfire/blackfire-*.so $(php -r "echo ini_get ('extension_dir');")/blackfire.so \
-#    && printf "extension=blackfire.so\nblackfire.agent_socket=tcp://blackfire:8307\n" > $PHP_INI_DIR/conf.d/blackfire.ini \
-#    && rm -rf /tmp/blackfire /tmp/blackfire-probe.tar.gz
+# Install testing-specific packages
+RUN apt-get update && apt-get install -y \
+    git curl wget \
+    zlib1g-dev libssl-dev libxml2-dev \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN php -r "opcache_reset();"
+# Install testing PHP extensions
+RUN install-php-extensions exif sockets soap gmp rdkafka
 
-# @todo Remove these steps as it is not required for latest Docker desktop.
-# Contains the Mac hack to get the permissions to work for development.
-# Set user 1000 and group staff to www-data, enables write permission.
-# https://github.com/boot2docker/boot2docker/issues/581#issuecomment-114804894
-#RUN usermod -u 1000 www-data
-#RUN usermod -G staff www-data
+# Copy dependencies from dependencies stage
+COPY --from=dependencies /var/www/vendor /var/www/vendor
 
-### DEV SPECIFIC - END ###
+# Copy composer files and install all dependencies (including dev)
+COPY composer.json ./
+ENV COMPOSER_ALLOW_SUPERUSER=1
+ENV COMPOSER_MEMORY_LIMIT=-1
+RUN composer install --prefer-dist --no-interaction
+
+# Install CI tools
+RUN ln -s /root/.composer/vendor/bin/behat /usr/local/bin/behat \
+    && ln -s /root/.composer/vendor/bin/phpunit /usr/local/bin/phpunit
+
+# Set PATH for CI tools
+ENV PATH="$PATH:/var/www/vendor/bin:/usr/local/bin"
+
+# Default to production stage (smallest)
+FROM production

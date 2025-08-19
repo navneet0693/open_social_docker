@@ -1,0 +1,66 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Documentation
+README.md
+*.md
+docs/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Cache directories
+.cache/
+cache/
+
+# Node modules (if any)
+node_modules/
+
+# Composer cache
+composer.lock
+vendor/
+
+# Drupal files
+sites/*/files/
+sites/*/private/
+sites/*/translations/
+
+# Backup files
+*.bak
+*.backup
+
+# Test files
+tests/
+test/
+phpunit.xml
+behat.yml
+
+# Docker files
+Dockerfile*
+docker-compose*
+.dockerignore
+
